@@ -21,17 +21,41 @@ struct Global {
 	} qualifier;
 };
 
-struct PrimitiveType {
-	enum {
-		boolean,
-		i32,
-		f32,
-		vec4,
-	} type;
+enum PrimitiveType {
+	bad,
+	boolean,
+	i32,
+	f32,
+	vec4,
+};
+
+struct TypeField {
+	// If the current field is a
+	// primitive, then item != BAD
+	PrimitiveType item;
+
+	// Otherwise it is a nested struct
+	int down;
+
+	// Next field
+	int next;
 };
 
 struct Primitive {
-	float fdata[4];
+	PrimitiveType type;
+	union {
+		bool b;
+		int idata[4];
+		float fdata[4];
+	};
+};
+
+struct Cmp {
+	int a;
+	int b;
+	enum {
+		eq, neq,
+	} type;
 };
 
 struct List {
@@ -49,6 +73,10 @@ struct Store {
 	int src;
 };
 
+struct Load {
+	int src;
+};
+
 struct Cond {
 	int cond;
 	int failto;
@@ -60,11 +88,13 @@ struct End {};
 
 using _general_base = std::variant <
 	Global,
-	PrimitiveType,
+	TypeField,
 	Primitive,
+	Cmp,
 	Construct,
 	List,
 	Store,
+	Load,
 	Cond,
 	Elif,
 	End
@@ -75,6 +105,14 @@ struct General : _general_base {
 };
 
 struct _dump_dispatcher {
+	const char* resolve(const op::PrimitiveType &t) {
+		static const char *type_table[] = {
+			"BAD", "bool", "int", "float", "vec4"
+		};
+
+		return type_table[t];
+	}
+
 	void operator()(const Global &global) {
 		static const char *qualifier_table[] = {
 			"layout input",
@@ -85,20 +123,38 @@ struct _dump_dispatcher {
 			qualifier_table[global.qualifier], global.binding);
 	}
 
-	void operator()(const op::PrimitiveType &t) {
-		static const char *type_table[] = {
-			"bool", "int", "float", "vec4"
-		};
+	void operator()(const op::TypeField &t) {
+		printf("type: ");
+		if (t.item != bad)
+			printf("%s", resolve(t.item));
+		else
+			printf("%d", t.down);
 
-		printf("type: %s", type_table[t.type]);
+		printf(" -> ");
+		if (t.next >= 0)
+			printf("%d", t.next);
+		else
+			printf("(nil)");
 	}
 
 	void operator()(const op::Primitive &p) {
-		printf("primitive: (%.2f, %.2f, %.2f, %.2f)",
-				p.fdata[0],
-				p.fdata[1],
-				p.fdata[2],
-				p.fdata[3]);
+		printf("primitive: %s = ", resolve(p.type));
+
+		switch (p.type) {
+		case i32:
+			printf("%d", p.idata[0]);
+			break;
+		case vec4:
+			printf("(%.2f, %.2f, %.2f, %.2f)",
+					p.fdata[0],
+					p.fdata[1],
+					p.fdata[2],
+					p.fdata[3]);
+			break;
+		default:
+			printf("?");
+			break;
+		}
 	}
 
 	void operator()(const List &list) {
@@ -115,6 +171,15 @@ struct _dump_dispatcher {
 
 	void operator()(const op::Store &store) {
 		printf("store %%%d -> %%%d", store.src, store.dst);
+	}
+
+	void operator()(const op::Load &load) {
+		printf("load %%%d", load.src);
+	}
+
+	void operator()(const op::Cmp &cmp) {
+		const char *cmp_table[] = { "=", "!=" };
+		printf("cmp %%%d %s %%%d", cmp.a, cmp_table[cmp.type], cmp.b);
 	}
 
 	void operator()(const op::Cond &cond) {
@@ -141,8 +206,8 @@ struct _dump_dispatcher {
 }
 
 template <typename T>
-concept synthesizable = requires {
-	{ T().synthesize() } -> std::same_as <int>;
+concept synthesizable = requires(const T &t) {
+	{ t.synthesize() } -> std::same_as <int>;
 };
 
 struct IREmitter {
@@ -152,6 +217,7 @@ struct IREmitter {
 	size_t pointer;
 
 	std::stack <int> control_flow_ends;
+	std::vector <int> main;
 
 	IREmitter() : pool(nullptr), size(0), pointer(0) {}
 
@@ -185,14 +251,20 @@ struct IREmitter {
 		return pointer++;
 	}
 
-	int emit(const op::Cond &cond) {
-		int p = emit((op::General) cond);
+	int emit_main(const op::General &op) {
+		int p = emit(op);
+		main.push_back(p);
+		return p;
+	}
+
+	int emit_main(const op::Cond &cond) {
+		int p = emit_main((op::General) cond);
 		control_flow_ends.push(p);
 		return p;
 	}
 
-	int emit(const op::Elif &elif) {
-		int p = emit((op::General) elif);
+	int emit_main(const op::Elif &elif) {
+		int p = emit_main((op::General) elif);
 		assert(control_flow_ends.size());
 		auto ref = control_flow_ends.top();
 		control_flow_ends.pop();
@@ -201,8 +273,8 @@ struct IREmitter {
 		return p;
 	}
 
-	int emit(const op::End &end) {
-		int p = emit((op::General) end);
+	int emit_main(const op::End &end) {
+		int p = emit_main((op::General) end);
 		assert(control_flow_ends.size());
 		auto ref = control_flow_ends.top();
 		control_flow_ends.pop();
@@ -227,6 +299,11 @@ struct IREmitter {
 	void dump() {
 		printf("GLOBALS (%4d/%4d)\n", pointer, size);
 		for (size_t i = 0; i < pointer; i++) {
+			if (std::ranges::find(main.begin(), main.end(), i) != main.end())
+				printf("[*] ");
+			else
+				printf("    ");
+
 			printf("[%4d]: ", i);
 			std::visit(op::_dump_dispatcher(), pool[i]);
 			printf("\n");
@@ -239,48 +316,49 @@ struct IREmitter {
 
 IREmitter IREmitter::active;
 
-struct tagged {
-	int tag;
-
-	tagged() {
-		tag = next();
-	}
-
-	static int next() {
-		static int local = 0;
-		return local++;
-	}
-};
+// Way to upcast C++ primitives into a workable type
+template <typename T>
+struct gltype {};
 
 template <typename T>
-struct gltype : tagged {
-	T data;
-	// bool cexpr;
-	gltype() = default;
-	gltype(T v) : data(v) {}
-};
-
-// TODO: fill this is in so that its not generated every time
-struct layout_qualifier : tagged {
-	// int synthesize() const {
-	// 	auto &em = IREmitter::active;
-	// }
-};
+constexpr auto type_match();
 
 template <typename T, size_t binding>
-struct layout_in : gltype <T> {};
+struct layout_in {
+	mutable int ref = -1;
+
+	int synthesize() const {
+		if (ref >= 0)
+			return ref;
+
+		auto &em = IREmitter::active;
+
+		// TODO: type_match t construct a TypeField
+		op::TypeField type;
+		type.item = type_match <T> ();
+		type.next = -1;
+
+		op::Global qualifier;
+		qualifier.type = em.emit(type);
+		qualifier.binding = binding;
+		qualifier.qualifier = op::Global::layout_in;
+
+		op::Load load;
+		load.src = em.emit(qualifier);
+
+		return (ref = em.emit_main(load));
+	}
+};
 
 template <typename T, size_t binding>
 requires synthesizable <T>
-struct layout_out : gltype <T> {
-	void operator=(const T &t) {
+struct layout_out {
+	void operator=(const T &t) const {
 		auto &em = IREmitter::active;
 
-		printf("op= from tag=%d\n", this->tag);
-		// TODO: check if t already has an active iseq
-
-		op::PrimitiveType type;
-		type.type = op::PrimitiveType::vec4;
+		op::TypeField type;
+		type.item = type_match <T> ();
+		type.next = -1;
 
 		op::Global qualifier;
 		qualifier.type = em.emit(type);
@@ -291,17 +369,18 @@ struct layout_out : gltype <T> {
 		store.dst = em.emit(qualifier);
 		store.src = t.synthesize();
 
-		em.emit(store);
+		em.emit_main(store);
 	}
 };
 
 template <typename T, size_t N>
-struct vec : gltype <T[N]> {
+struct vec {
+	T data[N];
 	constexpr vec() = default;
 
 	constexpr vec(T v) {
 		for (size_t i = 0; i < N; i++)
-			this->data[i] = v;
+			data[i] = v;
 	}
 
 	int synthesize() const {
@@ -309,51 +388,92 @@ struct vec : gltype <T[N]> {
 
 		auto &em = IREmitter::active;
 
-		op::PrimitiveType t;
-		t.type = op::PrimitiveType::vec4;
-
 		op::Primitive p;
-		// TODO: constexpr switch on T
-		std::memcpy(p.fdata, this->data, N * sizeof(T));
+		p.type = op::PrimitiveType::vec4;
+		std::memcpy(p.fdata, data, N * sizeof(T));
 
-		op::List l;
-		l.item = em.emit(p);
-		l.next = -1;
-
-		op::Construct ctor;
-		ctor.type = em.emit(t);
-		ctor.args = em.emit(l);
-
-		// TODO: emit and cache in one
-		return em.emit(ctor);
+		// TODO: only emit main if not trivial/cexpr
+		return em.emit(p);
 	}
 };
+
+template <>
+struct gltype <int> {
+	int value;
+	mutable int ref = -1;
+	// TODO: value or a chain of IR on its own
+
+	gltype(int v = 0) : value(v) {}
+
+	int synthesize() const {
+		// If ref != -1...
+		auto &em = IREmitter::active;
+
+		op::Primitive p;
+		p.type = op::PrimitiveType::i32;
+		p.idata[0] = value;
+
+		return (ref = em.emit(p));
+	}
+};
+
+template <>
+struct gltype <bool> {
+	bool value;
+	mutable int ref = -1;
+
+	int synthesize() const {
+		if (ref >= 0)
+			return ref;
+
+		auto &em = IREmitter::active;
+
+		op::Primitive t;
+		t.type = op::PrimitiveType::boolean;
+
+		return (ref = em.emit(t));
+	}
+};
+
+// Common types
+using boolean = gltype <bool>;
 
 using vec4 = vec <float, 4>;
 
-struct boolean : gltype <bool> {
-	int synthesize() {
-		auto &em = IREmitter::active;
-
-		op::PrimitiveType t;
-		t.type = op::PrimitiveType::f32;
-
-		return em.emit(t);
-	}
-};
-
+// Type matching
 template <typename T>
-boolean operator==(const gltype <T> &A, const gltype <T> &B)
+constexpr auto type_match()
 {
-	// get the tag of A and B and create a composite
-	return {};
+	if constexpr (std::is_same_v <T, bool>)
+		return op::PrimitiveType::boolean;
+	if constexpr (std::is_same_v <T, int>)
+		return op::PrimitiveType::i32;
+	if constexpr (std::is_same_v <T, float>)
+		return op::PrimitiveType::f32;
+	if constexpr (std::is_same_v <T, vec4>)
+		return op::PrimitiveType::vec4;
+
+	return op::PrimitiveType::bad;
 }
 
 template <typename T, typename U>
-requires std::is_constructible_v <gltype <T>, U>
-boolean operator==(const gltype <T> &A, const U &B)
+requires synthesizable <T> && synthesizable <U>
+boolean operator==(const T &A, const U &B)
 {
-	return (A == gltype <T> (B));
+	auto &em = IREmitter::active;
+
+	// TODO: ref mechanics
+	int a = A.synthesize();
+	int b = B.synthesize();
+
+	op::Cmp cmp;
+	cmp.a = a;
+	cmp.b = b;
+	cmp.type = op::Cmp::eq;
+
+	int c = em.emit(cmp);
+
+	return boolean { .ref = c };
 }
 
 // Branching emitters
@@ -362,7 +482,7 @@ void cond(boolean b)
 	auto &em = IREmitter::active;
 	op::Cond branch;
 	branch.cond = b.synthesize();
-	em.emit(branch);
+	em.emit_main(branch);
 }
 
 void elif(boolean b)
@@ -370,7 +490,7 @@ void elif(boolean b)
 	auto &em = IREmitter::active;
 	op::Elif branch;
 	branch.cond = b.synthesize();
-	em.emit(branch);
+	em.emit_main(branch);
 }
 
 void elif()
@@ -379,23 +499,29 @@ void elif()
 	auto &em = IREmitter::active;
 	op::Elif branch;
 	branch.cond = -1;
-	em.emit(branch);
+	em.emit_main(branch);
 }
 
 void end()
 {
 	auto &em = IREmitter::active;
-	em.emit(op::End());
+	em.emit_main(op::End());
 }
+
+// Guarantees
+static_assert(synthesizable <vec4>);
+static_assert(synthesizable <gltype <int>>);
+static_assert(synthesizable <boolean>);
+static_assert(synthesizable <layout_in <int, 0>>);
 
 void fragment_shader()
 {
 	layout_in <int, 0> flag;
 	layout_out <vec4, 0> fragment;
 
-	cond(flag == 0);
+	cond(flag == gltype <int> (0));
 		fragment = vec4(1.0);
-	elif(flag == 1);
+	elif(flag == gltype <int> (1));
 		fragment = vec4(0.5);
 	elif();
 		fragment = vec4(0.1);
@@ -405,7 +531,5 @@ void fragment_shader()
 int main()
 {
 	fragment_shader();
-
-	printf("IR:\n");
 	IREmitter::active.dump();
 }
