@@ -6,6 +6,10 @@
 #include <stack>
 #include <vector>
 #include <cassert>
+#include <map>
+#include <string>
+
+#include <fmt/format.h>
 
 namespace op {
 
@@ -104,12 +108,13 @@ struct General : _general_base {
 	using _general_base::_general_base;
 };
 
-struct _dump_dispatcher {
-	const char* resolve(const op::PrimitiveType &t) {
-		static const char *type_table[] = {
-			"BAD", "bool", "int", "float", "vec4"
-		};
+// Type translation
+static const char *type_table[] = {
+	"<BAD>", "bool", "int", "float", "vec4"
+};
 
+struct _dump_dispatcher {
+	const char* resolve(const PrimitiveType &t) {
 		return type_table[t];
 	}
 
@@ -123,7 +128,7 @@ struct _dump_dispatcher {
 			qualifier_table[global.qualifier], global.binding);
 	}
 
-	void operator()(const op::TypeField &t) {
+	void operator()(const TypeField &t) {
 		printf("type: ");
 		if (t.item != bad)
 			printf("%s", resolve(t.item));
@@ -137,7 +142,7 @@ struct _dump_dispatcher {
 			printf("(nil)");
 	}
 
-	void operator()(const op::Primitive &p) {
+	void operator()(const Primitive &p) {
 		printf("primitive: %s = ", resolve(p.type));
 
 		switch (p.type) {
@@ -165,28 +170,28 @@ struct _dump_dispatcher {
 			printf("(nil)");
 	}
 
-	void operator()(const op::Construct &ctor) {
+	void operator()(const Construct &ctor) {
 		printf("construct: %%%d = %%%d", ctor.type, ctor.args);
 	}
 
-	void operator()(const op::Store &store) {
+	void operator()(const Store &store) {
 		printf("store %%%d -> %%%d", store.src, store.dst);
 	}
 
-	void operator()(const op::Load &load) {
+	void operator()(const Load &load) {
 		printf("load %%%d", load.src);
 	}
 
-	void operator()(const op::Cmp &cmp) {
+	void operator()(const Cmp &cmp) {
 		const char *cmp_table[] = { "=", "!=" };
 		printf("cmp %%%d %s %%%d", cmp.a, cmp_table[cmp.type], cmp.b);
 	}
 
-	void operator()(const op::Cond &cond) {
+	void operator()(const Cond &cond) {
 		printf("cond %%%d -> %%%d", cond.cond, cond.failto);
 	}
 
-	void operator()(const op::Elif &elif) {
+	void operator()(const Elif &elif) {
 		if (elif.cond >= 0)
 			printf("elif %%%d -> %%%d", elif.cond, elif.failto);
 		else
@@ -200,6 +205,151 @@ struct _dump_dispatcher {
 	template <typename T>
 	void operator()(const T &) {
 		printf("<?>");
+	}
+};
+
+struct _typeof_dispatcher {
+	op::General *pool;
+
+	// TODO: cache system here as well
+
+	// TODO: needs to be persistent handle structs later
+	const char *resolve(const PrimitiveType type) {
+		return type_table[type];
+	}
+
+	std::string operator()(const TypeField &type) {
+		if (type.item != bad)
+			return resolve(type.item);
+		return "<?>";
+	}
+
+	std::string operator()(const Global &global) {
+		return defer(global.type);
+	}
+
+	template <typename T>
+	std::string operator()(const T &) {
+		return "<?>";
+	}
+
+	std::string defer(int index) {
+		return std::visit(*this, pool[index]);
+	}
+};
+
+struct _translate_dispatcher {
+	op::General *pool;
+	int generator = 0;
+	int indentation = 0;
+	int next_indentation = 0;
+	bool inlining = false;
+	std::map <int, std::string> symbols;
+
+	std::string operator()(const Cond &cond) {
+		next_indentation++;
+		std::string c = defer(cond.cond, true);
+		return "if (" + c + ") {";
+	}
+
+	std::string operator()(const Elif &elif) {
+		next_indentation = indentation--;
+		if (elif.cond == -1)
+			return "} else {";
+
+		std::string c = defer(elif.cond, true);
+		return "} else if (" + c + ") {";
+	}
+
+	std::string operator()(const End &) {
+		// TODO: verify which end?
+		next_indentation = indentation--;
+		return "}";
+	}
+
+	std::string operator()(const Global &global) {
+		switch (global.qualifier) {
+		case Global::layout_out:
+			return "_lout" + std::to_string(global.binding);
+		case Global::layout_in:
+			return "_lin" + std::to_string(global.binding);
+		default:
+			break;
+		}
+
+		return "<glo:?>";
+	}
+
+	std::string operator()(const Primitive &p) {
+		switch (p.type) {
+		case i32:
+			return std::to_string(p.idata[0]);
+		case vec4:
+			return "vec4("
+				+ std::to_string(p.fdata[0]) + ", "
+				+ std::to_string(p.fdata[1]) + ", "
+				+ std::to_string(p.fdata[2]) + ", "
+				+ std::to_string(p.fdata[3])
+				+ ")";
+		default:
+			break;
+		}
+
+		return "<prim:?>";
+	}
+
+	std::string operator()(const Load &load) {
+		// TODO: cache
+
+		bool inl = inlining;
+		std::string value = defer(load.src);
+		if (inl)
+			return value;
+
+		_typeof_dispatcher typer(pool);
+		std::string type = typer.defer(load.src);
+		std::string sym = "s" + std::to_string(generator++);
+		return type + " " + sym + " = " + value + ";";
+	}
+
+	std::string operator()(const Store &store) {
+		std::string lhs = defer(store.dst);
+		std::string rhs = defer(store.src);
+		return lhs + " = " + rhs + ";";
+	}
+
+	std::string operator()(const Cmp &cmp) {
+		bool inl = inlining;
+		std::string sa = defer(cmp.a, inl);
+		std::string sb = defer(cmp.b, inl);
+		switch (cmp.type) {
+		case Cmp::eq:
+			return sa + " == " + sb;
+		default:
+			break;
+		}
+
+		return "<cmp:?>";
+	}
+
+	template <typename T>
+	std::string operator()(const T &) {
+		return "<?>";
+	}
+
+	std::string defer(int index, bool inl = false) {
+		inlining = inl;
+		if (symbols.contains(index))
+			return symbols[index];
+
+		return std::visit(*this, pool[index]);
+	}
+
+	std::string eval(const op::General &general) {
+		std::string source = std::visit(*this, general) + "\n";
+		std::string space(indentation << 2, ' ');
+		indentation = next_indentation;
+		return space + source;
 	}
 };
 
@@ -233,6 +383,7 @@ struct IREmitter {
 		size = units;
 	}
 
+	// Emitting instructions during function invocation
 	int emit(const op::General &op) {
 		if (pointer >= size) {
 			if (size == 0)
@@ -296,6 +447,55 @@ struct IREmitter {
 		}
 	}
 
+	// Generating GLSL source code
+	std::string generate_glsl() {
+		// Gather all global shader variables
+		std::map <int, std::string> lins;
+		std::map <int, std::string> louts;
+
+		for (int i = 0; i < pointer; i++) {
+			auto op = pool[i];
+			if (!std::holds_alternative <op::Global> (op))
+				continue;
+
+			auto global = std::get <op::Global> (op);
+			auto type = std::visit(op::_typeof_dispatcher(pool), op);
+			if (global.qualifier == op::Global::layout_in)
+				lins[global.binding] = type;
+			else if (global.qualifier == op::Global::layout_out)
+				louts[global.binding] = type;
+		}
+
+		op::_translate_dispatcher tdisp;
+		tdisp.pool = pool;
+
+		std::string source;
+
+		// Version header
+		source += "#version 450\n";
+		source += "\n";
+
+		// Global shader variables
+		// TODO: check for vulkan target, etc
+		for (const auto &[binding, type] : lins)
+			source += fmt::format("layout (locatoon = {}) in {} _lin{};\n", binding, type, binding);
+		source += "\n";
+
+		for (const auto &[binding, type] : louts)
+			source += fmt::format("layout (locatoon = {}) out {} _lout{};\n", binding, type, binding);
+		source += "\n";
+
+		// Main function
+		source += "void main()\n";
+		source += "{\n";
+		for (int i : main)
+			source += "    " + tdisp.eval(pool[i]);
+		source += "}\n";
+
+		return source;
+	}
+
+	// Printing the IR state
 	void dump() {
 		printf("GLOBALS (%4d/%4d)\n", pointer, size);
 		for (size_t i = 0; i < pointer; i++) {
@@ -532,4 +732,8 @@ int main()
 {
 	fragment_shader();
 	IREmitter::active.dump();
+
+	auto source = IREmitter::active.generate_glsl();
+
+	printf("\nGLSL:\n%s", source.c_str());
 }
