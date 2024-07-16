@@ -728,12 +728,39 @@ void fragment_shader()
 	end();
 }
 
+#include <glad/gl.h>
+#include <GLFW/glfw3.h>
+
 int main()
 {
+	glfwInit();
+
 	fragment_shader();
 	IREmitter::active.dump();
 
 	auto source = IREmitter::active.generate_glsl();
 
 	printf("\nGLSL:\n%s", source.c_str());
+
+	glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+	GLFWwindow* window = glfwCreateWindow(800, 800, "LearnOpenGL", NULL, NULL);
+	if (window == NULL)
+	{
+		printf("failed to load glfw\n");
+		glfwTerminate();
+		return -1;
+	}
+	glfwMakeContextCurrent(window);
+
+	if (!gladLoadGL((GLADloadfunc) glfwGetProcAddress)) {
+		printf("failed to load glad\n");
+		return -1;
+	}
+
+	GLuint program = glCreateShader(GL_FRAGMENT_SHADER);
+	const char *source_c_str = source.c_str();
+	glShaderSource(program, 1, &source_c_str, nullptr);
+	glCompileShader(program);
+
+	printf("program: %d\n", program);
 }

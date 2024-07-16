@@ -1,7 +1,11 @@
-project(cppsl CXX)
+project(cppsl C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 
-add_executable(features main.cpp)
+add_executable(features
+	main.cpp
+	glad/src/gl.c)
 
-target_link_libraries(features fmt)
+include_directories(glad/include)
+
+target_link_libraries(features fmt glfw)
